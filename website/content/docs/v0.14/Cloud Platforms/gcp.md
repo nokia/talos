@@ -9,6 +9,8 @@ In this guide, we will create an HA Kubernetes cluster in GCP with 1 worker node
 We will assume an existing [Cloud Storage bucket](https://cloud.google.com/storage/docs/creating-buckets), and some familiarity with Google Cloud.
 If you need more information on Google Cloud specifics, please see the [official Google documentation](https://cloud.google.com/docs/).
 
+[jq](https://stedolan.github.io/jq/) and [talosctl](../../introduction/quickstart/#talosctl) also needs to be installed
+
 ### Environment Setup
 
 We'll make use of the following environment variables throughout the setup.
@@ -48,8 +50,12 @@ gcloud compute images create talos \
 
 #### Load Balancers and Firewalls
 
+##### Manual Setup
+
 Once the image is prepared, we'll want to work through setting up the network.
 Issue the following to create a firewall, load balancer, and their required components.
+
+`130.211.0.0/22` and `35.191.0.0/16` are the GCP [Load Balancer IP ranges](https://cloud.google.com/load-balancing/docs/health-checks#fw-rule)
 
 ```bash
 # Create Instance Group
@@ -104,6 +110,92 @@ gcloud compute firewall-rules create talos-controlplane-talosctl \
   --source-ranges 0.0.0.0/0 \
   --target-tags talos-controlplane \
   --allow tcp:50000
+```
+
+##### Using GCP Deployment Manager
+
+```yaml
+resources:
+- type: compute.v1.instanceGroup
+  name: talos-ig
+  properties:
+    description: Talos instance group
+    namedPorts:
+    - name: tcp6443
+      port: 6443
+- type: compute.v1.healthCheck
+  name: talos-healthcheck
+  properties:
+    description: Talos health check
+    type: TCP
+    tcpHealthCheck:
+      port: 6443
+- type: compute.v1.backendService
+  name: talos-be
+  properties:
+    description: Talos backend service
+    protocol: TCP
+    healthChecks:
+    - $(ref.talos-healthcheck.selfLink)
+    timeoutSec: 300
+    backends:
+    - description: Talos backend
+      group: $(ref.talos-ig.selfLink)
+    portName: tcp6443
+- type: compute.v1.targetTcpProxy
+  name: talos-tcp-proxy
+  properties:
+    description: Talos TCP proxy
+    service: $(ref.talos-be.selfLink)
+    proxyHeader: NONE
+- type: compute.v1.globalAddress
+  name: talos-lb-ip
+  properties:
+    description: Talos LoadBalancer IP
+- type: compute.v1.globalForwardingRule
+  name: talos-fwd-rule
+  properties:
+    description: Talos Forwarding rule
+    target: $(ref.talos-tcp-proxy.selfLink)
+    IPAddress: $(ref.talos-lb-ip.address)
+    IPProtocol: TCP
+    portRange: 443
+- type: compute.v1.firewall
+  name: talos-controlplane-firewall
+  properties:
+    description: Talos controlplane firewall
+    sourceRanges:
+    - 130.211.0.0/22
+    - 35.191.0.0/16
+    targetTags:
+    - talos-controlplane
+    allowed:
+    - IPProtocol: TCP
+      ports:
+      - 6443
+- type: compute.v1.firewall
+  name: talos-controlplane-talosctl
+  properties:
+    description: Talos controlplane talosctl firewall
+    sourceRanges:
+    - 0.0.0.0/0
+    targetTags:
+    - talos-controlplane
+    allowed:
+    - IPProtocol: TCP
+      ports:
+      - 50000
+outputs:
+- name: loadbalancerIP
+  value: $(ref.talos-lb-ip.address)
+```
+
+Save the above as `network-infrastructure.yaml` and run the following command to bring up the infra
+
+```bash
+gcloud deployment-manager deployments create \
+  network-infrastructure \
+  --config network-infrastructure.yaml
 ```
 
 ### Cluster Configuration
@@ -182,4 +274,69 @@ At this point we can retrieve the admin `kubeconfig` by running:
 
 ```bash
 talosctl --talosconfig talosconfig kubeconfig .
+```
+
+### Cleanup
+
+#### Manual
+
+```bash
+# cleanup VM's
+gcloud compute instances delete \
+  talos-worker-0 \
+  talos-controlplane-0 \
+  talos-controlplane-1 \
+  talos-controlplane-2
+
+# cleanup firewall rules
+gcloud compute firewall-rules delete \
+  talos-controlplane-talosctl \
+  talos-controlplane-firewall
+
+# cleanup forwarding rules
+gcloud compute forwarding-rules delete \
+  talos-fwd-rule
+
+# cleanup addresses
+gcloud compute addresses delete \
+  talos-lb-ip
+
+# cleanup proxies
+gcloud compute target-tcp-proxies delete \
+  talos-tcp-proxy
+
+# cleanup backend services
+gcloud compute backend-services delete \
+  talos-be
+
+# cleanup health checks
+gcloud compute health-checks delete \
+  talos-health-check
+
+# cleanup unmanaged instance groups
+gcloud compute instance-groups unmanaged delete \
+  talos-ig
+
+# cleanup Talos image
+gcloud compute images delete \
+  talos
+```
+
+#### Using Deployment Manager
+
+```bash
+# cleanup VM's
+gcloud compute instances delete \
+  talos-worker-0 \
+  talos-controlplane-0 \
+  talos-controlplane-1 \
+  talos-controlplane-2
+
+# cleanup infrastructure deployment
+gcloud deployment-manager deployments delete \
+  network-infrastructure
+
+# cleanup Talos image
+gcloud compute images delete \
+  talos
 ```
